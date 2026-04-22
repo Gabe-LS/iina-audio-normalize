@@ -2,37 +2,42 @@
 
 Automatic audio normalization for IINA. Analyzes each file on playback and applies gain to bring the volume to a consistent level.
 
-> **Note:** requires ffmpeg and IINA 1.4.0 or later. Tested on macOS Sequoia 15.4 with IINA 1.4.0.
+> **Note:** requires ffmpeg and IINA 1.4.0 or later. Tested on macOS Tahoe 26.3.1 with IINA 1.4.1.
 
 ---
 
-## What it does
+## Features
 
-When you open a video, the plugin:
-
-1. Fingerprints the file using BLAKE3, xxHash, or SHA256 (whichever is fastest and available)
-2. Checks its local cache — if this file was already analyzed, skips straight to step 4
-3. Runs ffmpeg to scan the audio track (peak detection or EBU R128 loudness measurement)
-4. Calculates the appropriate gain and applies it as an mpv audio filter
-5. Shows the result on a small on-screen indicator
-
-All settings — mode, target, compression limits, OSD appearance — are configurable in IINA's preferences panel.
+- **Three normalization modes** — peak, R128 YouTube (−14 LUFS), R128 Broadcast (−24 LUFS)
+- **Two-stage R128 scan** — fast ebur128 measurement (~30s), slow loudnorm only when dynamic compression is needed (~4min). Most well-mastered content finishes in under a minute.
+- **Hybrid R128 compression** — linear gain when possible, dynamic compression only when needed, capped to prevent artifacts
+- **Analysis caching** — BLAKE3/xxHash/SHA256 fingerprinting with automatic expiry
+- **Enhanced 5.1 downmix** — full-weight center channel for clearer dialogue, LFE preserved instead of discarded
+- **Configurable OSD** — position, size, minimum duration (auto-extends for longer messages), toggle on/off
+- **Stale scan protection** — rapidly switching files discards outdated analysis results
+- **Streaming support** — works on URLs and streams (without caching)
+- **Auto-detect ffmpeg** — checks Homebrew and system paths automatically
 
 ---
 
-## Modes
+## Dependencies
 
-| Mode | Target | Method |
-|------|--------|--------|
-| Peak normalize | −1.0 dB (configurable) | Flat linear gain to bring the sample peak to the target |
-| R128 YouTube | −14 LUFS, TP −1 dBTP | EBU R128 loudness normalization |
-| R128 Broadcast | −24 LUFS, TP −2 dBTP | EBU R128 loudness normalization |
+All dependencies are installed via [Homebrew](https://brew.sh). If you don't have Homebrew, open Terminal and run:
 
-R128 modes use a hybrid strategy:
+```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
 
-- **Linear** — if the needed gain keeps the true peak below the ceiling, a simple stateless volume filter is applied (no seek overhead, no compression artifacts)
-- **Dynamic** — if linear gain would clip, the loudnorm filter is used with dynamic compression, limited by a configurable maximum (default 6 dB) to prevent unnatural results
-- **Capped** — if the compression needed exceeds the limit, the LUFS target is reduced to stay within the allowed compression range
+**Required:**
+
+- **ffmpeg** — `brew install ffmpeg`. The plugin auto-detects `/opt/homebrew/bin/ffmpeg` and `/usr/local/bin/ffmpeg`, or you can set a custom path in preferences.
+
+**Optional (faster file fingerprinting):**
+
+- **b3sum** — BLAKE3 hash, ~71 ms for a 3 GB file. `brew install b3sum`
+- **xxhsum** — xxHash, ~149 ms for a 3 GB file. `brew install xxhash`
+
+Without either, the plugin falls back to OpenSSL SHA256 (~560 ms for 3 GB), which is built into macOS.
 
 ---
 
@@ -53,18 +58,32 @@ R128 modes use a hybrid strategy:
 
 ---
 
-## Dependencies
+## How it works
 
-**Required:**
+When you open a video, the plugin:
 
-- **ffmpeg** — install with `brew install ffmpeg` if you don't have it. The plugin auto-detects `/opt/homebrew/bin/ffmpeg` and `/usr/local/bin/ffmpeg`, or you can set a custom path in preferences.
+1. Fingerprints the file using BLAKE3, xxHash, or SHA256 (whichever is fastest and available)
+2. Checks its local cache — if this file was already analyzed, skips straight to step 5
+3. Runs a fast scan using ffmpeg's ebur128 filter (~30s for a 45-min episode)
+4. If linear gain is sufficient, applies immediately. If dynamic compression is needed, runs a full loudnorm scan (~4 min) to get precise offset data.
+5. Calculates the appropriate gain and applies it as an mpv audio filter
+6. Shows the result on the OSD indicator: `Audio Normalize: R128 YT +3.2 dB (linear, cached)`
 
-**Optional (faster file fingerprinting):**
+---
 
-- **b3sum** — BLAKE3 hash, ~71ms for a 3 GB file. Install with `brew install b3sum`
-- **xxhsum** — xxHash, ~149ms for a 3 GB file. Install with `brew install xxhash`
+## Modes
 
-Without either, the plugin falls back to OpenSSL SHA256 (~560ms for 3 GB), which is built into macOS.
+| Mode | Target | Method |
+|------|--------|--------|
+| Peak normalize | −1.0 dB (configurable) | Flat linear gain to bring the sample peak to the target |
+| R128 YouTube | −14 LUFS, TP −1 dBTP | EBU R128 loudness normalization |
+| R128 Broadcast | −24 LUFS, TP −2 dBTP | EBU R128 loudness normalization |
+
+R128 modes use a hybrid strategy:
+
+- **Linear** — if the needed gain keeps the true peak below the ceiling, a simple stateless volume filter is applied (no seek overhead, no compression artifacts)
+- **Dynamic** — if linear gain would clip, the loudnorm filter is used with dynamic compression, limited by a configurable maximum (default 6 dB) to prevent unnatural results
+- **Capped** — if the compression needed exceeds the limit, the LUFS target is reduced to stay within the allowed compression range
 
 ---
 
@@ -82,7 +101,7 @@ All settings are in **IINA → Settings → Plugin → Audio Normalize → Prefe
 | Show on-screen indicator | On | OSD overlay during analysis and on result |
 | Indicator position | Bottom left | Top left, top right, bottom left, or bottom right |
 | Indicator size | Medium | Tiny, small, medium, or large |
-| OSD duration (s) | 4 | How long the result indicator stays visible |
+| OSD duration (s) | 4 | Minimum display time; automatically extended for longer messages based on reading time |
 | Cache retention (months) | 3 | Analysis results older than this are pruned on launch |
 | ffmpeg path | auto-detect | Override if ffmpeg is in a non-standard location |
 
@@ -100,14 +119,16 @@ Under **Plugin → Audio Normalize** in the menu bar:
 
 ## OSD indicators
 
-| Dot color | Meaning |
-|-----------|---------|
-| Yellow (pulsing) | Scanning in progress |
-| Green | Filter applied successfully |
-| Orange | Filter applied but LUFS target was capped |
-| Grey | Skipped, error, or disabled |
+All messages are prefixed with `Audio Normalize:`.
 
-Result messages include tags for context, e.g. `R128 YT: +3.2 dB (linear, cached, downmix)`.
+| Dot color | Meaning | Example |
+|-----------|---------|---------|
+| Yellow (pulsing) | Scanning in progress | `Fast scan… 34%`, `Deep scan… 52%` |
+| Green | Filter applied | `R128 YT +3.2 dB (linear, cached)` |
+| Orange | Filter applied, LUFS target was capped | `R128 YT +7.0 dB, target was +14.8 (capped)` |
+| Grey | Skipped, error, or disabled | `Disabled`, `No audio data` |
+
+Tags in parentheses provide context: `linear` (volume filter), `compressed` (loudnorm filter), `capped` (target reduced), `cached` (from cache), `downmix` (5.1→stereo active), `no change` (already at target).
 
 ---
 
@@ -123,36 +144,31 @@ Analysis results are cached to avoid re-scanning files you've already watched. T
 
 ---
 
-## Features
-
-- **Three normalization modes** — peak, R128 YouTube (−14 LUFS), R128 Broadcast (−24 LUFS)
-- **Hybrid R128 compression** — linear gain when possible, dynamic compression only when needed, capped to prevent artifacts
-- **Analysis caching** — BLAKE3/xxHash/SHA256 fingerprinting with automatic expiry
-- **Enhanced 5.1 downmix** — full-weight center channel for clearer dialogue, LFE preserved instead of discarded
-- **Configurable OSD** — position, size, duration, toggle on/off
-- **Stale scan protection** — rapidly switching files discards outdated analysis results
-- **Streaming support** — works on URLs and streams (without caching)
-- **Auto-detect ffmpeg** — checks Homebrew and system paths automatically
-
----
-
 ## Technical details
 
 <details>
 <summary>Click to expand</summary>
 
-**How the scan works**
+**Two-stage R128 scan**
 
-The plugin runs ffmpeg as a subprocess to analyze the audio:
+R128 analysis uses two ffmpeg filters with very different performance characteristics:
 
-- Peak mode: `ffmpeg -nostdin -i file -map 0:a:0 -vn -sn -ac 2 -threads 4 -af volumedetect -f null /dev/null`
-- R128 mode: same flags with `-af loudnorm=I=<target>:TP=<ceiling>:LRA=11:print_format=json`
+| Filter | Speed (45-min 5.1 file) | Purpose |
+|--------|------------------------|---------|
+| ebur128 | ~30 seconds | Measures integrated loudness, true peak, LRA, threshold |
+| loudnorm | ~4 minutes | Same measurements plus `target_offset` for two-pass normalization |
 
-Flags breakdown: `-map 0:a:0` selects only the first audio stream, `-vn -sn` skips video and subtitle decoding, `-ac 2` downmixes to stereo for faster processing, `-threads 4` parallelizes the audio decoder.
+The plugin always runs ebur128 first (fast scan). If the file can be normalized with simple linear gain (a stateless volume filter), the result is applied immediately — no need for the slow loudnorm scan. Only when dynamic compression is required does the plugin run the full loudnorm scan (deep scan) to obtain the `target_offset` value needed for loudnorm's two-pass mode.
+
+Benchmarking showed that loudnorm is ~20× slower than raw audio decoding, while ebur128 is only ~4× slower. The bottleneck is loudnorm's internal processing (true peak upsampling to 192kHz, normalization curve computation), not audio decoding.
+
+**ffmpeg flags**
+
+Both scans use: `-map 0:a:0` (first audio stream only), `-vn -sn` (skip video and subtitle decoding), `-ac 2` (downmix to stereo for faster processing), `-threads 4` (parallelize audio decoder), `-progress pipe:1` (machine-readable progress to stdout, keeping results in stderr separate).
 
 **R128 hybrid strategy**
 
-Given measured values (integrated loudness, true peak, loudness range, threshold, offset):
+Given measured values from ebur128 (integrated loudness, true peak, loudness range, threshold):
 
 1. Calculate the gain needed to reach the LUFS target
 2. Calculate the maximum gain that keeps true peak below the ceiling
@@ -162,6 +178,8 @@ Given measured values (integrated loudness, true peak, loudness range, threshold
 6. If compression > max_compression → reduce the LUFS target so that compression stays within the limit
 
 Step 3 is important for seek performance: the `loudnorm` filter maintains internal state (sliding windows, lookahead buffers) that must be rebuilt on every seek. The `volume` filter is a stateless multiplier with zero overhead. Using `volume` for the linear case means most well-mastered content gets instant seeking.
+
+For the linear case, the loudnorm `target_offset` is not needed — gain is simply `target_I − measured_I`. The offset only matters for loudnorm's internal two-pass algorithm.
 
 **Downmix matrix**
 
@@ -191,21 +209,22 @@ The plugin tries each in order and uses the first one that succeeds. BLAKE3 is f
   "de6a39b57b621ab4...": {
     "mode": "r128-youtube",
     "ts": 1745370000000,
-    "loudness_lufs": -26.97,
-    "true_peak_dbtp": -1.95,
+    "loudness_lufs": -27,
+    "true_peak_dbtp": -2,
     "loudness_range_lu": 13.8,
-    "threshold_lufs": -38.47,
+    "threshold_lufs": -38.5,
     "offset_lu": 1.83
   }
 }
 ```
 
-One entry per file fingerprint. The `ts` field is a Unix timestamp in milliseconds used for auto-pruning. Switching modes overwrites the entry. Settings like target peak and max compression are not stored — they're computed on playback from the cached measurements.
+One entry per file fingerprint. The `ts` field is a Unix timestamp in milliseconds used for auto-pruning. Switching modes overwrites the entry. Settings like target peak and max compression are not stored — they're computed on playback from the cached measurements. `offset_lu` is `null` for files where linear gain was sufficient (no loudnorm scan was needed); if the user later changes settings so dynamic compression is required, a loudnorm scan runs to obtain it.
 
 **Known limitations**
 
-- Scan time is proportional to file duration (~3 minutes for a 45-minute 5.1 episode). Cached files are instant on subsequent plays.
+- Fast scan (ebur128) takes ~30 seconds for a 45-minute 5.1 episode. If dynamic compression is needed, the full loudnorm scan adds ~4 more minutes. Cached files are instant on subsequent plays.
 - Abandoned ffmpeg scans (when you skip files rapidly) run to completion in the background because IINA's plugin API does not support process cancellation. Their results are discarded.
+- The ebur128 filter measures true peak in dBFS (sample-accurate) rather than dBTP (upsampled to 192kHz per ITU-R BS.1770). The difference is negligible for media player use (<0.5 dB).
 - The downmix matrix assumes a standard 5.1 channel layout. 7.1 or non-standard layouts may produce unexpected results.
 
 **Files**
