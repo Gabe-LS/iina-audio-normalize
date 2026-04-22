@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {
+    padding: 16px 20px;
+  }
+
+  .pref-section {
+    margin-bottom: 24px;
+  }
+
+  .pref-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  .pref-row label {
+    min-width: 150px;
+  }
+
+  .radio-group {
+    margin-top: 6px;
+  }
+
+  .radio-group label {
+    display: block;
+    padding: 3px 0;
+  }
+
+  input[type="number"] {
+    width: 70px;
+    padding: 3px 6px;
+  }
+
+  input[type="text"] {
+    width: 100%;
+    padding: 3px 6px;
+    margin-top: 6px;
+  }
+
+  .section-label {
+    font-weight: 500;
+  }
+
+  .pref-help {
+    margin-top: 6px;
+    line-height: 1.4;
+  }
+</style>
+</head>
+<body>
+  <div class="pref-section">
+    <label>
+      <input type="checkbox" data-type="bool" data-pref-key="enabled" />
+      Enable normalization
+    </label>
+  </div>
+
+  <div class="pref-section">
+    <div class="section-label">Mode:</div>
+    <div class="radio-group" data-radio-key="mode">
+      <label><input type="radio" name="mode" value="peak" /> Peak normalize</label>
+      <label><input type="radio" name="mode" value="r128-youtube" /> R128 YouTube (&minus;14 LUFS)</label>
+      <label><input type="radio" name="mode" value="r128-broadcast" /> R128 Broadcast (&minus;24 LUFS)</label>
+    </div>
+    <p class="small secondary pref-help">
+      Peak: linear gain to target peak dB.
+      R128: EBU R128 loudness normalization with hybrid linear/dynamic compression.
+    </p>
+  </div>
+
+  <div class="pref-section">
+    <div class="pref-row">
+      <label for="target_peak">Target peak (dB):</label>
+      <input type="number" id="target_peak" data-type="float" data-pref-key="target_peak"
+             min="-20" max="0" step="0.5" />
+    </div>
+    <p class="small secondary pref-help">
+      Only used in Peak mode. Default: &minus;1.0 dB
+    </p>
+  </div>
+
+  <div class="pref-section">
+    <div class="pref-row">
+      <label for="max_compression">Max compression (dB):</label>
+      <input type="number" id="max_compression" data-type="float" data-pref-key="max_compression"
+             min="0" max="20" step="1" />
+    </div>
+    <p class="small secondary pref-help">
+      R128 modes only. Maximum dynamic compression beyond linear gain.
+      If exceeded, the LUFS target is capped to avoid unnatural results. Default: 6 dB
+    </p>
+  </div>
+
+  <div class="pref-section">
+    <label>
+      <input type="checkbox" data-type="bool" data-pref-key="downmix" />
+      Enhanced 5.1 &rarr; stereo downmix
+    </label>
+    <p class="small secondary pref-help">
+      Replaces mpv's default downmix with an improved matrix: full-weight center channel
+      for clearer dialogue, and mixes in the LFE instead of discarding it.
+      Only applies when audio has more than 2 channels.
+    </p>
+  </div>
+
+  <div class="pref-section">
+    <label>
+      <input type="checkbox" data-type="bool" data-pref-key="show_osd" />
+      Show on-screen indicator
+    </label>
+  </div>
+
+  <div class="pref-section">
+    <div class="section-label">Indicator position:</div>
+    <div class="radio-group" data-radio-key="osd_position">
+      <label><input type="radio" name="osd_position" value="top-left" /> Top left</label>
+      <label><input type="radio" name="osd_position" value="top-right" /> Top right</label>
+      <label><input type="radio" name="osd_position" value="bottom-left" /> Bottom left</label>
+      <label><input type="radio" name="osd_position" value="bottom-right" /> Bottom right</label>
+    </div>
+  </div>
+
+  <div class="pref-section">
+    <div class="section-label">Indicator size:</div>
+    <div class="radio-group" data-radio-key="osd_size">
+      <label><input type="radio" name="osd_size" value="tiny" /> Tiny</label>
+      <label><input type="radio" name="osd_size" value="small" /> Small</label>
+      <label><input type="radio" name="osd_size" value="medium" /> Medium</label>
+      <label><input type="radio" name="osd_size" value="large" /> Large</label>
+    </div>
+  </div>
+
+  <div class="pref-section">
+    <div class="pref-row">
+      <label for="osd_duration">OSD duration (s):</label>
+      <input type="number" id="osd_duration" data-type="int" data-pref-key="osd_duration"
+             min="1" max="30" step="1" />
+    </div>
+  </div>
+
+  <div class="pref-section">
+    <div class="pref-row">
+      <label for="cache_months">Cache retention (months):</label>
+      <input type="number" id="cache_months" data-type="int" data-pref-key="cache_months"
+             min="1" max="24" step="1" />
+    </div>
+    <p class="small secondary pref-help">
+      Analysis results older than this are automatically removed on launch. Default: 3
+    </p>
+  </div>
+
+  <div class="pref-section">
+    <div class="section-label">ffmpeg path:</div>
+    <input type="text" data-pref-key="ffmpeg_path"
+           placeholder="/opt/homebrew/bin/ffmpeg" />
+    <p class="small secondary pref-help">
+      Binary name or full path. Default: auto-detect
+    </p>
+  </div>
+
+  <script>
+    var prefs = window.iina.preferences;
+
+    var groups = document.querySelectorAll("[data-radio-key]");
+    Array.prototype.forEach.call(groups, function(group) {
+      var key = group.getAttribute("data-radio-key");
+      var radios = group.querySelectorAll('input[type="radio"]');
+
+      prefs.get(key, function(value) {
+        if (value !== undefined && value !== null) {
+          Array.prototype.forEach.call(radios, function(radio) {
+            radio.checked = (radio.value === value);
+          });
+        }
+      });
+
+      Array.prototype.forEach.call(radios, function(radio) {
+        radio.addEventListener("change", function() {
+          if (radio.checked) {
+            prefs.set(key, radio.value);
+          }
+        });
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "name": "Audio Normalize",
+  "identifier": "io.github.audio-normalize",
+  "version": "1.0.0",
+  "description": "Audio normalization with analysis caching: peak, EBU R128 YouTube, or EBU R128 Broadcast",
+  "author": {
+    "name": "Gabriele Lo Surdo",
+    "url": "https://github.com/Gabe-LS"
+  },
+  "entry": "main.js",
+  "preferencesPage": "preferences.html",
+  "ghRepo": "Gabe-LS/iina-audio-normalize",
+  "ghVersion": 1,
+  "preferenceDefaults": {
+    "enabled": true,
+    "mode": "peak",
+    "target_peak": -1.0,
+    "max_compression": 6,
+    "downmix": false,
+    "show_osd": true,
+    "osd_position": "bottom-left",
+    "osd_size": "medium",
+    "osd_duration": 4,
+    "cache_months": 3,
+    "ffmpeg_path": "ffmpeg"
+  },
+  "permissions": [
+    "show-osd",
+    "video-overlay",
+    "file-system"
+  ]
+}
