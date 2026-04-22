@@ -2,43 +2,35 @@
 // Audio Normalize — IINA Plugin
 // =============================================================================
 // Normalizes audio playback using peak or EBU R128 loudness analysis.
-// Supports caching of analysis results with BLAKE3/xxHash/SHA256 fingerprinting.
 //
-// Modes:
-//   - Peak: flat linear gain to bring the sample peak to a target dB
-//   - R128 YouTube (-14 LUFS): EBU R128 with hybrid linear/dynamic compression
-//   - R128 Broadcast (-24 LUFS): EBU R128 with hybrid linear/dynamic compression
-//
-// Cache structure (one entry per file, overwritten on mode change):
-//   { "fingerprint": { mode, ts, peak_db } }                          — peak
-//   { "fingerprint": { mode, ts, loudness_lufs, true_peak_dbtp, … } } — R128
+// R128 scanning uses a two-stage strategy:
+//   1. ebur128 filter (fast, ~30-48s for 45min file) measures loudness and peak
+//   2. If linear gain is sufficient: apply immediately — done in under a minute
+//   3. If dynamic compression needed: run loudnorm scan (~4min) for offset data
 //
 // Dependencies: ffmpeg (required), b3sum/xxhsum (optional, faster hashing)
 // =============================================================================
 
 var { core, event, mpv, overlay, utils, console, preferences, file, menu } = iina;
 
-// --- CONSTANTS ---
+// --- FILTER LABELS & STATE ---
 
-var FILTER_NORM = "audionorm";       // mpv af label for normalization filter
-var FILTER_DMX = "audionorm-dmx";    // mpv af label for downmix filter
-var CACHE_PATH = "@data/cache.json"; // plugin data directory
-var hideTimer = null;
-var overlayReady = false;
-var cache = {};
-var scanGeneration = 0;              // incremented per analysis to detect stale scans
-                                     // NOTE: abandoned ffmpeg processes run to completion
-                                     // because IINA's utils.exec has no cancellation API.
-                                     // Results are discarded via generation check, but CPU
-                                     // is consumed until the process finishes naturally.
+var FILTER_NORM = "audionorm";       // mpv audio filter label for normalization
+var FILTER_DMX = "audionorm-dmx";    // mpv audio filter label for downmix
+var CACHE_PATH = "@data/cache.json"; // persisted in IINA plugin data directory
+var hideTimer = null;                // setTimeout ID for auto-hiding the OSD
+var overlayReady = false;            // true after first initOverlay() call (requires window)
+var cache = {};                      // fingerprint → analysis data
+var scanGeneration = 0;              // incremented per runAnalysis; stale scans compare against this
 
-// R128 target presets: I = integrated loudness (LUFS), TP = true peak (dBTP), LRA = loudness range (LU)
+// R128 preset targets per EBU R128 / YouTube / broadcast standards
+// I = integrated loudness target (LUFS), TP = true peak ceiling (dBTP), LRA = loudness range (LU)
 var R128_PRESETS = {
   "r128-youtube":   { I: -14, TP: -1, LRA: 11, label: "YT" },
   "r128-broadcast": { I: -24, TP: -2, LRA: 11, label: "TV" }
 };
 
-// OSD indicator sizes
+// OSD indicator sizing per preference setting
 var SIZE_MAP = {
   tiny:   { font: 9,  pad: "4px 9px",  dot: 4, gap: 6 },
   small:  { font: 11, pad: "5px 10px", dot: 5, gap: 7 },
@@ -46,7 +38,7 @@ var SIZE_MAP = {
   large:  { font: 15, pad: "7px 14px", dot: 7, gap: 9 }
 };
 
-var EDGE = "20px"; // distance from video border for all OSD positions
+var EDGE = "20px"; // distance from window edge for OSD positioning
 
 // =============================================================================
 // CACHE
@@ -78,7 +70,6 @@ function pruneCache() {
   var cutoff = Date.now() - (months * 30 * 24 * 60 * 60 * 1000);
   var keys = Object.keys(cache);
   var pruned = 0;
-
   for (var i = 0; i < keys.length; i++) {
     var entry = cache[keys[i]];
     if (!entry || typeof entry !== "object" || !entry.ts || entry.ts < cutoff) {
@@ -86,7 +77,6 @@ function pruneCache() {
       pruned++;
     }
   }
-
   if (pruned > 0) {
     saveCache();
     console.log("Cache pruned: removed " + pruned + " expired/invalid entries");
@@ -106,9 +96,7 @@ function saveCache() {
 function clearCache() {
   cache = {};
   try {
-    if (file.exists(CACHE_PATH)) {
-      file.delete(CACHE_PATH);
-    }
+    if (file.exists(CACHE_PATH)) { file.delete(CACHE_PATH); }
   } catch (e) {}
   console.log("Cache cleared");
   showStatusSafe("done", "Cache cleared");
@@ -120,7 +108,7 @@ function showStatusSafe(dotClass, text) {
   if (overlayReady) {
     showStatus(dotClass, text, osdDuration);
   } else {
-    console.log("OSD (no window): " + text);
+    console.log("OSD (no window): " + OSD_PREFIX + text);
   }
 }
 
@@ -131,7 +119,6 @@ function showStatusSafe(dotClass, text) {
 /** Check if a path is a local file (not a URL/stream). */
 function isLocalFile(path) {
   if (!path) return false;
-  // URLs start with protocol://
   if (/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(path)) return false;
   return true;
 }
@@ -147,48 +134,40 @@ async function getFingerprint(filePath) {
     return null;
   }
 
-  // Try BLAKE3: parallelized, ~71ms for 3GB
   try {
     var b3Path = findTool(["/opt/homebrew/bin/b3sum", "/usr/local/bin/b3sum"]);
     if (b3Path) {
       var result = await utils.exec(b3Path, ["--no-names", filePath]);
       var hash = result.stdout.trim();
-      if (hash) {
-        console.log("blake3: " + hash.substring(0, 16) + "\u2026");
-        return hash;
-      }
+      if (hash) { console.log("blake3: " + hash.substring(0, 16) + "\u2026"); return hash; }
     }
   } catch (e) {}
 
-  // Try xxHash64: ~149ms for 3GB
   try {
     var xxhPath = findTool(["/opt/homebrew/bin/xxhsum", "/usr/local/bin/xxhsum"]);
     if (xxhPath) {
       var result = await utils.exec(xxhPath, ["-H1", filePath]);
       var hash = result.stdout.trim().split(/\s+/)[0];
-      if (hash) {
-        console.log("xxh64: " + hash);
-        return hash;
-      }
+      if (hash) { console.log("xxh64: " + hash); return hash; }
     }
   } catch (e) {}
 
-  // Fallback: OpenSSL SHA256 (~560ms for 3GB, guaranteed on all Macs)
   try {
     console.log("Using openssl sha256 fallback");
     var result = await utils.exec("openssl", ["dgst", "-sha256", filePath]);
     var match = result.stdout.match(/=\s*([0-9a-f]+)/);
-    if (match) {
-      console.log("sha256: " + match[1].substring(0, 16) + "\u2026");
-      return match[1];
-    }
+    if (match) { console.log("sha256: " + match[1].substring(0, 16) + "\u2026"); return match[1]; }
   } catch (e) {}
 
   console.log("All fingerprint methods failed, caching disabled for this file");
   return null;
 }
 
-/** Find the first available tool from a list of absolute paths. */
+/**
+ * Return the first absolute path from the list.
+ * IINA's sandbox prevents checking if files exist at absolute paths,
+ * so we trust that standard Homebrew/system paths are valid.
+ */
 function findTool(paths) {
   for (var i = 0; i < paths.length; i++) {
     if (paths[i].charAt(0) === "/") return paths[i];
@@ -209,14 +188,14 @@ function getPositionCSS(pos) {
   }
 }
 
+/** Build the CSS string for the OSD overlay based on position and size preferences. */
 function buildCSS(position, size) {
   var s = SIZE_MAP[size] || SIZE_MAP.medium;
   var posCSS = getPositionCSS(position);
-
   return '.pn-status {' +
     '  position: fixed;' +
     '  ' + posCSS +
-    '  background: rgba(0, 0, 0, 0.4);' +
+    '  background: rgba(0, 0, 0, 0.3);' +
     '  color: #fff;' +
     '  font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;' +
     '  font-size: ' + s.font + 'px;' +
@@ -227,6 +206,13 @@ function buildCSS(position, size) {
     '  display: flex;' +
     '  align-items: center;' +
     '  gap: ' + s.gap + 'px;' +
+    '  cursor: default;' +
+    '  -webkit-user-select: none;' +
+    '  user-select: none;' +
+    '  -webkit-text-stroke: 0;' +
+    '  text-shadow: none;' +
+    '  -webkit-font-smoothing: antialiased;' +
+    '  font-variant-numeric: tabular-nums;' +
     '}' +
     '.pn-dot {' +
     '  width: ' + s.dot + 'px;' +
@@ -256,16 +242,26 @@ function initOverlay() {
   overlayReady = true;
 }
 
-/** Show a status indicator on the OSD overlay. Duration 0 = stay until replaced. */
+var OSD_PREFIX = "Audio Normalize: ";
+
+/**
+ * Show a status indicator on the OSD overlay.
+ * Duration 0 = stay until replaced (used by scanning progress).
+ * Duration > 0 = auto-hide after the longer of: the passed duration or
+ * a reading-time estimate (~120ms per character), ensuring long messages
+ * stay visible long enough to read.
+ */
 function showStatus(dotClass, text, duration) {
   if (!overlayReady) return;
   overlay.setContent(
-    '<div class="pn-status"><span class="pn-dot ' + dotClass + '"></span>' + text + '</div>'
+    '<div class="pn-status"><span class="pn-dot ' + dotClass + '"></span>' + OSD_PREFIX + text + '</div>'
   );
   overlay.show();
   if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
   if (duration > 0) {
-    hideTimer = setTimeout(function() { overlay.hide(); hideTimer = null; }, duration);
+    var readTime = (OSD_PREFIX.length + text.length) * 120;
+    var effectiveDuration = Math.max(duration, readTime);
+    hideTimer = setTimeout(function() { overlay.hide(); hideTimer = null; }, effectiveDuration);
   }
 }
 
@@ -279,6 +275,7 @@ function removeFilters() {
   try { mpv.command("af", ["remove", "@" + FILTER_NORM]); } catch (e) {}
 }
 
+/** Return "+" for non-negative numbers, "" for negative (sign is already in the number). */
 function signStr(n) { return n >= 0 ? "+" : ""; }
 
 /** Format an array of tags like ["cached", "downmix"] into " (cached, downmix)". */
@@ -296,7 +293,6 @@ function getChannelCount() {
  * Apply enhanced 5.1→stereo downmix filter.
  * Uses full-weight center channel (clearer dialogue) and mixes in 50% LFE.
  * Standard 5.1 layout assumed: FL, FR, FC, LFE, SL, SR.
- * Returns true if downmix was applied, false if skipped (stereo or mono source).
  */
 function applyDownmix() {
   var channels = getChannelCount();
@@ -328,48 +324,116 @@ function isValidPeakEntry(entry) {
 function applyPeakFilter(entry, targetPeak, showOsd, osdDuration, tags) {
   if (!isValidPeakEntry(entry)) {
     console.log("Invalid peak data, skipping");
-    if (showOsd) showStatus("skip", "Peak: invalid data", osdDuration);
+    if (showOsd) showStatus("skip", "Invalid peak data", osdDuration);
     return;
   }
-
   var gain = targetPeak - entry.peak_db;
-
+  // Skip filter if gain is less than 0.1 dB (inaudible)
   if (Math.abs(gain) < 0.1) {
-    if (showOsd) showStatus("done", "Peak " + entry.peak_db.toFixed(1) + " dB \u2014 OK" + formatTags(tags), osdDuration);
+    if (showOsd) showStatus("done", "Peak " + entry.peak_db.toFixed(1) + " dB" + formatTags(tags.concat(["no change"])), osdDuration);
     return;
   }
-
   try {
     mpv.command("af", ["add", "@" + FILTER_NORM + ":volume=volume=" + gain.toFixed(1) + "dB"]);
   } catch (e) {
     console.log("Failed to apply volume filter: " + e);
-    if (showOsd) showStatus("skip", "Peak: filter error", osdDuration);
+    if (showOsd) showStatus("skip", "Filter error", osdDuration);
     return;
   }
-  if (showOsd) showStatus("done", "Peak: " + signStr(gain) + gain.toFixed(1) + " dB" + formatTags(tags), osdDuration);
+  if (showOsd) showStatus("done", "Peak " + signStr(gain) + gain.toFixed(1) + " dB" + formatTags(tags), osdDuration);
 }
 
-/** Run ffmpeg volumedetect on a file and return { peak_db } or null. */
-async function scanPeak(filePath, ffmpegPath) {
-  var result = await utils.exec(ffmpegPath,
-    ["-nostdin", "-i", filePath, "-map", "0:a:0", "-vn", "-sn", "-ac", "2", "-threads", "4",
-     "-af", "volumedetect", "-f", "null", "/dev/null"]);
-
+/**
+ * Run ffmpeg volumedetect on a file and return { peak_db } or null.
+ * Progress is reported via -progress pipe:1 (stdout) through the stdoutHook callback,
+ * while results come from stderr — clean separation, no interference.
+ */
+async function scanPeak(filePath, ffmpegPath, onProgress) {
+  var args = ["-nostdin", "-i", filePath, "-map", "0:a:0", "-vn", "-sn", "-ac", "2", "-threads", "4",
+     "-af", "volumedetect", "-progress", "pipe:1", "-f", "null", "/dev/null"];
+  var result = await utils.exec(ffmpegPath, args, undefined, onProgress);
   if (result.status !== 0) {
     console.log("ffmpeg exited with status " + result.status + ", attempting to parse output anyway");
   }
-
   var match = result.stderr.match(/max_volume:\s*([+\-\d.]+)/);
   if (!match) return null;
-
   var val = parseFloat(match[1]);
   if (isNaN(val)) return null;
-
   return { peak_db: val };
 }
 
 // =============================================================================
-// R128 MODE
+// R128 MODE — EBUR128 (FAST SCAN, ~5× FASTER THAN LOUDNORM)
+// =============================================================================
+
+/**
+ * Parse the ebur128 summary block from ffmpeg stderr.
+ *
+ * IMPORTANT: ebur128 outputs per-frame data AND a summary at the end.
+ * Per-frame lines look like: "t: 0.4  M: -70.0  S: -70.0  I: -70.0 LUFS  LRA: 0.0 LU"
+ * We must extract the Summary section first to avoid matching per-frame values.
+ *
+ * Note: ebur128 reports true peak in dBFS (sample-accurate), not dBTP
+ * (which involves upsampling to 192kHz as per ITU-R BS.1770). For our
+ * media player use case, the difference is negligible (<0.5 dB).
+ *
+ * Returns { loudness_lufs, true_peak_dbtp, loudness_range_lu, threshold_lufs } or null.
+ */
+function parseEbur128Summary(stderr) {
+  // Extract only the Summary section (always at the end of stderr)
+  var summaryMatch = stderr.match(/Summary:[\s\S]+$/);
+  if (!summaryMatch) {
+    console.log("ebur128: no Summary section found in output");
+    return null;
+  }
+  var summary = summaryMatch[0];
+
+  // Integrated loudness
+  var iMatch = summary.match(/I:\s*([+\-\d.]+)\s*LUFS/);
+  // Threshold under Integrated loudness section
+  var threshMatch = summary.match(/Integrated loudness:[\s\S]*?Threshold:\s*([+\-\d.]+)\s*LUFS/);
+  // LRA
+  var lraMatch = summary.match(/LRA:\s*([+\-\d.]+)\s*LU/);
+  // True peak — take the highest (least negative) across all channels
+  var peaks = [];
+  var peakRegex = /Peak:\s*([+\-\d.]+)\s*dBFS/g;
+  var m;
+  while ((m = peakRegex.exec(summary)) !== null) {
+    peaks.push(parseFloat(m[1]));
+  }
+
+  if (!iMatch || !threshMatch || !lraMatch || peaks.length === 0) {
+    console.log("ebur128: failed to parse summary fields");
+    return null;
+  }
+
+  var data = {
+    loudness_lufs: parseFloat(iMatch[1]),
+    true_peak_dbtp: Math.max.apply(null, peaks),
+    loudness_range_lu: parseFloat(lraMatch[1]),
+    threshold_lufs: parseFloat(threshMatch[1])
+  };
+
+  var fields = ["loudness_lufs", "true_peak_dbtp", "loudness_range_lu", "threshold_lufs"];
+  for (var i = 0; i < fields.length; i++) {
+    if (typeof data[fields[i]] !== "number" || isNaN(data[fields[i]])) return null;
+  }
+  return data;
+}
+
+/** Fast R128 scan using ebur128 filter (~5× faster than loudnorm). */
+async function scanEbur128(filePath, ffmpegPath, onProgress) {
+  var args = ["-nostdin", "-i", filePath, "-map", "0:a:0", "-vn", "-sn", "-ac", "2", "-threads", "4",
+     "-af", "ebur128=peak=true", "-progress", "pipe:1", "-f", "null", "/dev/null"];
+  var result = await utils.exec(ffmpegPath, args, undefined, onProgress);
+  if (result.status !== 0) {
+    console.log("ffmpeg ebur128 exited with status " + result.status);
+  }
+  return parseEbur128Summary(result.stderr);
+}
+
+// =============================================================================
+// R128 MODE — LOUDNORM (SLOW SCAN, ONLY USED WHEN DYNAMIC COMPRESSION NEEDED)
 // =============================================================================
 
 /** Extract the loudnorm JSON block from ffmpeg stderr output. */
@@ -379,10 +443,40 @@ function parseR128Json(stderr) {
   try { return JSON.parse(jsonMatch[0]); } catch (e) { return null; }
 }
 
+/**
+ * Run loudnorm scan to get the target_offset value needed for two-pass dynamic compression.
+ * This is the slow scan (~4 min for a 45-min file) — only called when ebur128 determines
+ * that linear gain is insufficient and dynamic compression is needed.
+ * Returns { offset_lu } or null.
+ */
+async function scanLoudnormOffset(filePath, ffmpegPath, preset, onProgress) {
+  var p = R128_PRESETS[preset];
+  var scanFilter = "loudnorm=I=" + p.I + ":TP=" + p.TP + ":LRA=" + p.LRA + ":print_format=json";
+  var args = ["-nostdin", "-i", filePath, "-map", "0:a:0", "-vn", "-sn", "-ac", "2", "-threads", "4",
+     "-af", scanFilter, "-progress", "pipe:1", "-f", "null", "/dev/null"];
+
+  var result = await utils.exec(ffmpegPath, args, undefined, onProgress);
+  if (result.status !== 0) {
+    console.log("ffmpeg loudnorm exited with status " + result.status);
+  }
+
+  var parsed = parseR128Json(result.stderr);
+  if (!parsed) return null;
+
+  var offset = parseFloat(parsed.target_offset);
+  if (isNaN(offset)) return null;
+
+  return { offset_lu: offset };
+}
+
+// =============================================================================
+// R128 MODE — FILTER APPLICATION
+// =============================================================================
+
 /** Validate that a cache entry has all required R128 fields. */
 function isValidR128Entry(entry) {
   if (!entry) return false;
-  var fields = ["loudness_lufs", "true_peak_dbtp", "loudness_range_lu", "threshold_lufs", "offset_lu"];
+  var fields = ["loudness_lufs", "true_peak_dbtp", "loudness_range_lu", "threshold_lufs"];
   for (var i = 0; i < fields.length; i++) {
     if (typeof entry[fields[i]] !== "number" || isNaN(entry[fields[i]])) return false;
   }
@@ -390,54 +484,71 @@ function isValidR128Entry(entry) {
 }
 
 /**
- * Apply R128 normalization filter based on cached/scanned measurements.
+ * Check if linear gain alone can reach the LUFS target without exceeding the TP ceiling.
+ * For linear, gain = target_I - measured_I (no loudnorm offset — offset only applies
+ * to loudnorm's internal algorithm, not to a simple volume filter).
+ */
+function isLinearSufficient(entry, preset) {
+  var p = R128_PRESETS[preset];
+  if (!p) return false;
+  var gain = p.I - entry.loudness_lufs;
+  var projectedTP = entry.true_peak_dbtp + gain;
+  return projectedTP <= p.TP + 0.1; // 0.1 dB tolerance for measurement rounding
+}
+
+/**
+ * Apply R128 normalization filter.
  *
  * Strategy:
- *   1. If linear gain alone keeps TP within ceiling → use simple volume filter (stateless, no seek overhead)
- *   2. If compression needed ≤ max_compression → use loudnorm at full target
- *   3. If compression needed > max_compression → use loudnorm at capped target to limit artifacts
+ *   1. Linear: simple volume filter (gain = target_I - measured_I, no offset)
+ *   2. Dynamic (compression ≤ limit): loudnorm at full target with offset
+ *   3. Capped (compression > limit): loudnorm at reduced target with offset
  */
 function applyR128Filter(entry, preset, maxCompression, showOsd, osdDuration, tags) {
   if (!isValidR128Entry(entry)) {
     console.log("Invalid R128 data, skipping");
-    if (showOsd) showStatus("skip", "R128: invalid data", osdDuration);
+    if (showOsd) showStatus("skip", "Invalid R128 data", osdDuration);
     return;
   }
 
   var p = R128_PRESETS[preset];
   if (!p) {
     console.log("Unknown preset: " + preset);
-    if (showOsd) showStatus("skip", "R128: unknown mode", osdDuration);
+    if (showOsd) showStatus("skip", "Unknown mode", osdDuration);
     return;
   }
 
-  var neededGain = p.I - entry.loudness_lufs + entry.offset_lu;
+  // Linear gain: target - measured (no offset, volume filter doesn't use loudnorm internals)
+  var linearGain = p.I - entry.loudness_lufs;
+  var projectedTP = entry.true_peak_dbtp + linearGain;
+
+  // Dynamic gain: includes loudnorm offset if available
+  var offset = (typeof entry.offset_lu === "number" && !isNaN(entry.offset_lu)) ? entry.offset_lu : 0;
+  var dynGain = p.I - entry.loudness_lufs + offset;
   var maxLinearGain = p.TP - entry.true_peak_dbtp;
-  var projectedTP = entry.true_peak_dbtp + neededGain;
 
-  console.log("Needed gain: " + neededGain.toFixed(1) + " dB, max linear: " +
-    maxLinearGain.toFixed(1) + " dB, projected TP: " + projectedTP.toFixed(1) + " dBTP");
+  console.log("Linear gain: " + linearGain.toFixed(1) + " dB, projected TP: " + projectedTP.toFixed(1) +
+    " dBTP, offset: " + offset.toFixed(2));
 
-  // Case 1: Linear — use simple volume filter (stateless, no seek overhead)
+  // Case 1: Linear — simple volume filter (stateless, no seek overhead)
   if (projectedTP <= p.TP + 0.1) {
-    console.log("Strategy: linear (volume filter, " + neededGain.toFixed(1) + " dB)");
+    console.log("Strategy: linear (volume filter, " + linearGain.toFixed(1) + " dB)");
     try {
-      mpv.command("af", ["add", "@" + FILTER_NORM + ":volume=volume=" + neededGain.toFixed(1) + "dB"]);
+      mpv.command("af", ["add", "@" + FILTER_NORM + ":volume=volume=" + linearGain.toFixed(1) + "dB"]);
     } catch (e) {
       console.log("Failed to apply volume filter: " + e);
-      if (showOsd) showStatus("skip", "R128: filter error", osdDuration);
+      if (showOsd) showStatus("skip", "Filter error", osdDuration);
       return;
     }
-
     var resultTags = (tags || []).concat(["linear"]);
     if (showOsd) showStatus("done",
-      "R128 " + p.label + ": " + signStr(neededGain) + neededGain.toFixed(1) + " dB" + formatTags(resultTags),
+      "R128 " + p.label + " " + signStr(linearGain) + linearGain.toFixed(1) + " dB" + formatTags(resultTags),
       osdDuration);
     return;
   }
 
   // Case 2: Dynamic compression needed
-  var compressionNeeded = neededGain - maxLinearGain;
+  var compressionNeeded = dynGain - maxLinearGain;
   console.log("Compression needed: " + compressionNeeded.toFixed(1) + " dB (limit: " + maxCompression + " dB)");
 
   var effectiveTarget;
@@ -447,26 +558,29 @@ function applyR128Filter(entry, preset, maxCompression, showOsd, osdDuration, ta
     effectiveTarget = p.I;
     console.log("Strategy: dynamic, full target " + effectiveTarget + " LUFS");
   } else {
-    // Cap the target to limit compression artifacts
+    // Reduce the LUFS target so compression stays within the allowed limit.
+    // Formula: start from measured loudness, add the max safe linear gain, add allowed compression.
     effectiveTarget = entry.loudness_lufs + maxLinearGain + maxCompression;
     capped = true;
     console.log("Strategy: dynamic capped, effective target " + effectiveTarget.toFixed(1) +
       " LUFS (original " + p.I + " LUFS)");
   }
 
+  // Build loudnorm filter with pre-measured values (two-pass mode).
+  // This avoids loudnorm re-analyzing the audio and instead uses our cached measurements.
   var filter = "loudnorm=I=" + effectiveTarget.toFixed(1) + ":TP=" + p.TP + ":LRA=" + p.LRA +
     ":linear=false" +
     ":measured_I=" + entry.loudness_lufs +
     ":measured_TP=" + entry.true_peak_dbtp +
     ":measured_LRA=" + entry.loudness_range_lu +
     ":measured_thresh=" + entry.threshold_lufs +
-    ":offset=" + entry.offset_lu;
+    ":offset=" + offset;
 
   try {
     mpv.command("af", ["add", "@" + FILTER_NORM + ":lavfi=[" + filter + "]"]);
   } catch (e) {
     console.log("Failed to apply loudnorm filter: " + e);
-    if (showOsd) showStatus("skip", "R128: filter error", osdDuration);
+    if (showOsd) showStatus("skip", "Filter error", osdDuration);
     return;
   }
 
@@ -475,46 +589,59 @@ function applyR128Filter(entry, preset, maxCompression, showOsd, osdDuration, ta
     if (capped) {
       var warnTags = (tags || []).concat(["capped"]);
       showStatus("warn",
-        "R128 " + p.label + ": " + signStr(totalGain) + totalGain.toFixed(1) +
-        " dB, target was " + signStr(neededGain) + neededGain.toFixed(1) + formatTags(warnTags),
+        "R128 " + p.label + " " + signStr(totalGain) + totalGain.toFixed(1) +
+        " dB, target was " + signStr(dynGain) + dynGain.toFixed(1) + formatTags(warnTags),
         osdDuration);
     } else {
       var compTags = (tags || []).concat(["compressed"]);
       showStatus("done",
-        "R128 " + p.label + ": " + signStr(neededGain) + neededGain.toFixed(1) + " dB" + formatTags(compTags),
+        "R128 " + p.label + " " + signStr(dynGain) + dynGain.toFixed(1) + " dB" + formatTags(compTags),
         osdDuration);
     }
   }
 }
 
-/** Run ffmpeg loudnorm scan on a file and return measurement object or null. */
-async function scanR128(filePath, ffmpegPath, preset) {
-  var p = R128_PRESETS[preset];
-  var scanFilter = "loudnorm=I=" + p.I + ":TP=" + p.TP + ":LRA=" + p.LRA + ":print_format=json";
+// =============================================================================
+// PROGRESS TRACKING
+// =============================================================================
 
-  var result = await utils.exec(ffmpegPath,
-    ["-nostdin", "-i", filePath, "-map", "0:a:0", "-vn", "-sn", "-ac", "2", "-threads", "4",
-     "-af", scanFilter, "-f", "null", "/dev/null"]);
+/**
+ * Create a progress callback for ffmpeg's -progress pipe:1 output.
+ * Updates OSD only when integer percentage changes (avoids webview flooding).
+ * Logs to console every 10%.
+ */
+function createProgressHook(totalDurationSec, label, showOsd) {
+  var lastLoggedPct = -10;
+  var lastDisplayedPct = -1;
 
-  if (result.status !== 0) {
-    console.log("ffmpeg exited with status " + result.status + ", attempting to parse output anyway");
-  }
-
-  var measured = parseR128Json(result.stderr);
-  if (!measured) return null;
-
-  var data = {
-    loudness_lufs: parseFloat(measured.input_i),
-    true_peak_dbtp: parseFloat(measured.input_tp),
-    loudness_range_lu: parseFloat(measured.input_lra),
-    threshold_lufs: parseFloat(measured.input_thresh),
-    offset_lu: parseFloat(measured.target_offset)
+  return function(data) {
+    if (!totalDurationSec || totalDurationSec <= 0) return;
+    var match = data.match(/out_time_us=(\d+)/);
+    if (!match) return;
+    var currentUs = parseInt(match[1]);
+    if (isNaN(currentUs) || currentUs < 0) return;
+    var pct = Math.min(100, Math.round((currentUs / 1000000) / totalDurationSec * 100));
+    if (showOsd && pct !== lastDisplayedPct) {
+      lastDisplayedPct = pct;
+      // Pad to 3 chars with figure spaces (\u2007) to prevent OSD width jitter
+      var pctStr = (pct < 10 ? "\u2007\u2007" : pct < 100 ? "\u2007" : "") + pct + "%";
+      showStatus("scanning", label + " " + pctStr, 0);
+    }
+    if (pct >= lastLoggedPct + 10) {
+      lastLoggedPct = pct - (pct % 10);
+      console.log("Scan progress: " + pct + "%");
+    }
   };
+}
 
-  // Validate parsed values
-  if (!isValidR128Entry(data)) return null;
-
-  return data;
+/** Get the total duration of the current file from mpv. Returns 0 if unavailable. */
+function getFileDuration() {
+  try {
+    var d = mpv.getNumber("duration");
+    return (d && d > 0) ? d : 0;
+  } catch (e) {
+    return 0;
+  }
 }
 
 // =============================================================================
@@ -532,14 +659,13 @@ var FFMPEG_PATHS = [
  * Find ffmpeg binary. Priority:
  *   1. User-configured absolute path
  *   2. User-configured name in PATH
- *   3. First known Homebrew/system location
+ *   3. First known Homebrew/system location (absolute paths trusted, sandbox can't verify)
  *   4. Bare "ffmpeg" as last resort
  */
 function findFfmpeg() {
   var custom = preferences.get("ffmpeg_path");
   if (custom && custom.charAt(0) === "/") return custom;
   if (custom && custom !== "ffmpeg" && utils.fileInPath(custom)) return custom;
-  // Default to first known location (absolute paths trusted, sandbox can't verify)
   if (FFMPEG_PATHS.length > 0) return FFMPEG_PATHS[0];
   return "ffmpeg";
 }
@@ -561,7 +687,6 @@ var toggleItem = menu.item("Audio Normalize", function() {
 
   if (isEnabled) {
     console.log("Enabled via menu");
-    // Only run analysis if a file is currently loaded
     try {
       var path = mpv.getString("path");
       if (path) runAnalysis(false);
@@ -607,12 +732,13 @@ event.on("iina.window-loaded", function() {
 
 /**
  * Main analysis and filter application logic.
- * Called on file-loaded, menu toggle (enable), and reanalyze.
  *
- * @param {boolean} forceRescan - If true, ignore cache and re-scan the file.
+ * For R128 modes, uses a two-stage strategy:
+ *   Stage 1: ebur128 scan (fast, ~30-48s) — measures loudness and peak
+ *   Stage 2: If linear gain works → apply immediately, done
+ *            If dynamic needed → run loudnorm scan (~4min) for offset, then apply
  */
 async function runAnalysis(forceRescan) {
-  // Capture scan generation to detect if a newer scan supersedes this one
   scanGeneration++;
   var myGeneration = scanGeneration;
 
@@ -633,76 +759,91 @@ async function runAnalysis(forceRescan) {
     if (showOsd) showStatusSafe("skip", "No file loaded");
     return;
   }
+  if (!filePath) { console.log("Empty file path"); return; }
 
-  if (!filePath) {
-    console.log("Empty file path");
-    return;
-  }
-
+  // Hide any previous OSD and cancel pending timer before reinitializing
+  if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+  if (overlayReady) overlay.hide();
   initOverlay();
   removeFilters();
 
   // Apply downmix filter (before normalization in the chain)
   var didDownmix = false;
-  if (doDownmix) {
-    didDownmix = applyDownmix();
-  }
+  if (doDownmix) { didDownmix = applyDownmix(); }
 
   // Generate fingerprint for caching (null for streams/URLs)
   var fingerprint = await getFingerprint(filePath);
-
-  // Stale scan check: if another file was loaded during fingerprinting, abort
+  // Fingerprinting is async (~70ms); check if a newer file was loaded while we waited
   if (myGeneration !== scanGeneration) {
     console.log("Scan aborted: newer file loaded during fingerprinting");
     return;
   }
 
   var cached = fingerprint ? cache[fingerprint] : null;
+  // Cache entries are mode-specific: switching modes requires a rescan
   var cacheHit = !forceRescan && cached && cached.mode === mode;
 
-  // Build OSD tags for the result message
+  // Build OSD tags
   var tags = [];
   if (didDownmix) tags.push("downmix");
 
   try {
-    if (cacheHit) {
-      console.log("Cache hit (" + mode + ") for: " + fingerprint);
-      var hitTags = tags.concat(["cached"]);
-
-      if (mode === "peak") {
-        var targetPeak = parseFloat(preferences.get("target_peak"));
-        if (isNaN(targetPeak)) targetPeak = -1.0;
-        applyPeakFilter(cached, targetPeak, showOsd, osdDuration, hitTags);
-      } else {
-        console.log("Cached R128: " + cached.loudness_lufs + " LUFS, TP " + cached.true_peak_dbtp + " dBTP");
-        applyR128Filter(cached, mode, maxCompression, showOsd, osdDuration, hitTags);
-      }
+    // =================================================================
+    // CACHE HIT — PEAK
+    // =================================================================
+    if (cacheHit && mode === "peak") {
+      console.log("Cache hit (peak) for: " + fingerprint);
+      var targetPeak = parseFloat(preferences.get("target_peak"));
+      if (isNaN(targetPeak)) targetPeak = -1.0;
+      applyPeakFilter(cached, targetPeak, showOsd, osdDuration, tags.concat(["cached"]));
       return;
     }
 
-    // --- SCAN ---
+    // =================================================================
+    // CACHE HIT — R128
+    // =================================================================
+    if (cacheHit && mode !== "peak") {
+      console.log("Cache hit (" + mode + ") for: " + fingerprint);
+      console.log("Cached R128: " + cached.loudness_lufs + " LUFS, TP " + cached.true_peak_dbtp + " dBTP");
 
+      if (isLinearSufficient(cached, mode)) {
+        // Linear path: offset not needed, ebur128 data is enough
+        applyR128Filter(cached, mode, maxCompression, showOsd, osdDuration, tags.concat(["cached"]));
+        return;
+      }
+
+      if (cached.offset_lu !== null && cached.offset_lu !== undefined) {
+        // Dynamic path: offset was cached from a previous loudnorm scan
+        applyR128Filter(cached, mode, maxCompression, showOsd, osdDuration, tags.concat(["cached"]));
+        return;
+      }
+
+      // Dynamic needed but no offset cached — fall through to scan
+      console.log("Cache hit but dynamic needed without offset — need loudnorm scan");
+    }
+
+    // =================================================================
+    // SCAN — PEAK
+    // =================================================================
     if (mode === "peak") {
-      if (showOsd) showStatus("scanning", "Analyzing peak\u2026", 0);
+      if (showOsd) showStatus("scanning", "Fast scan\u2026", 0);
       console.log("Peak scan: " + filePath);
 
-      var peakData = await scanPeak(filePath, ffmpegPath);
+      var duration = getFileDuration();
+      var progressHook = createProgressHook(duration, "Fast scan\u2026", showOsd);
+      var peakData = await scanPeak(filePath, ffmpegPath, progressHook);
 
-      // Stale scan check
       if (myGeneration !== scanGeneration) {
         console.log("Scan aborted: newer file loaded during peak scan");
         return;
       }
-
       if (!peakData) {
         console.log("Peak scan returned no data");
-        if (showOsd) showStatus("skip", "Peak: no audio data", osdDuration);
+        if (showOsd) showStatus("skip", "No audio data", osdDuration);
         return;
       }
 
       console.log("Peak: " + peakData.peak_db + " dB");
-
-      // Cache the result
       if (fingerprint) {
         cache[fingerprint] = { mode: mode, ts: Date.now(), peak_db: peakData.peak_db };
         saveCache();
@@ -711,47 +852,110 @@ async function runAnalysis(forceRescan) {
       var targetPeak = parseFloat(preferences.get("target_peak"));
       if (isNaN(targetPeak)) targetPeak = -1.0;
       applyPeakFilter(peakData, targetPeak, showOsd, osdDuration, tags);
+      return;
+    }
 
-    } else {
-      if (showOsd) showStatus("scanning", "Analyzing loudness\u2026", 0);
-      console.log("R128 scan (" + mode + "): " + filePath);
+    // =================================================================
+    // SCAN — R128 (TWO-STAGE: FAST EBUR128, THEN LOUDNORM IF NEEDED)
+    // =================================================================
 
-      var r128Data = await scanR128(filePath, ffmpegPath, mode);
+    console.log("R128 scan (" + mode + "): " + filePath);
+    var duration = getFileDuration();
+    var scanStartTime = Date.now();
 
-      // Stale scan check
-      if (myGeneration !== scanGeneration) {
-        console.log("Scan aborted: newer file loaded during R128 scan");
-        return;
-      }
+    // --- Stage 1: Fast ebur128 scan ---
+    if (showOsd) showStatus("scanning", "Fast scan\u2026", 0);
+    var progressHook = createProgressHook(duration, "Fast scan\u2026", showOsd);
+    var ebur128Data = await scanEbur128(filePath, ffmpegPath, progressHook);
 
-      if (!r128Data) {
-        console.log("R128 scan returned no data");
-        if (showOsd) showStatus("skip", "R128: scan failed", osdDuration);
-        return;
-      }
+    var ebur128ElapsedSec = ((Date.now() - scanStartTime) / 1000).toFixed(1);
 
-      console.log("Measured: " + r128Data.loudness_lufs + " LUFS, TP " + r128Data.true_peak_dbtp + " dBTP");
+    if (myGeneration !== scanGeneration) {
+      console.log("Scan aborted: newer file loaded during ebur128 scan");
+      return;
+    }
 
-      // Cache the result
+    if (!ebur128Data) {
+      console.log("ebur128 scan returned no data");
+      if (showOsd) showStatus("skip", "Scan failed", osdDuration);
+      return;
+    }
+
+    console.log("ebur128 result: " + ebur128Data.loudness_lufs + " LUFS, TP " +
+      ebur128Data.true_peak_dbtp + " dBTP, LRA " + ebur128Data.loudness_range_lu +
+      " LU (scanned in " + ebur128ElapsedSec + "s)");
+
+    // --- Check if linear gain is sufficient ---
+    if (isLinearSufficient(ebur128Data, mode)) {
+      console.log("Linear sufficient — applied in " + ebur128ElapsedSec +
+        "s (full loudnorm scan would have taken ~5\u00d7 longer)");
+
       if (fingerprint) {
+        // Cache ebur128 data. offset_lu is null because linear gain doesn't need it;
+        // if the user later changes settings so dynamic is needed, a loudnorm scan will run.
         cache[fingerprint] = {
-          mode: mode,
-          ts: Date.now(),
-          loudness_lufs: r128Data.loudness_lufs,
-          true_peak_dbtp: r128Data.true_peak_dbtp,
-          loudness_range_lu: r128Data.loudness_range_lu,
-          threshold_lufs: r128Data.threshold_lufs,
-          offset_lu: r128Data.offset_lu
+          mode: mode, ts: Date.now(),
+          loudness_lufs: ebur128Data.loudness_lufs,
+          true_peak_dbtp: ebur128Data.true_peak_dbtp,
+          loudness_range_lu: ebur128Data.loudness_range_lu,
+          threshold_lufs: ebur128Data.threshold_lufs,
+          offset_lu: null
         };
         saveCache();
       }
 
-      applyR128Filter(r128Data, mode, maxCompression, showOsd, osdDuration, tags);
+      applyR128Filter(ebur128Data, mode, maxCompression, showOsd, osdDuration, tags);
+      return;
     }
+
+    // --- Stage 2: Dynamic compression needed — run loudnorm for offset ---
+    console.log("Dynamic compression needed, running loudnorm scan for offset...");
+    if (showOsd) showStatus("scanning", "Deep scan\u2026", 0);
+
+    var loudnormProgressHook = createProgressHook(duration, "Deep scan\u2026", showOsd);
+    var loudnormResult = await scanLoudnormOffset(filePath, ffmpegPath, mode, loudnormProgressHook);
+
+    if (myGeneration !== scanGeneration) {
+      console.log("Scan aborted: newer file loaded during loudnorm scan");
+      return;
+    }
+
+    var totalElapsedSec = ((Date.now() - scanStartTime) / 1000).toFixed(1);
+
+    var offset = (loudnormResult && typeof loudnormResult.offset_lu === "number") ? loudnormResult.offset_lu : 0;
+    if (!loudnormResult) {
+      console.log("Loudnorm scan failed, using offset=0");
+    } else {
+      console.log("Loudnorm offset: " + offset.toFixed(2));
+    }
+    console.log("Full R128 analysis completed in " + totalElapsedSec + "s");
+
+    // Merge ebur128 measurements with loudnorm offset
+    var mergedData = {
+      loudness_lufs: ebur128Data.loudness_lufs,
+      true_peak_dbtp: ebur128Data.true_peak_dbtp,
+      loudness_range_lu: ebur128Data.loudness_range_lu,
+      threshold_lufs: ebur128Data.threshold_lufs,
+      offset_lu: offset
+    };
+
+    if (fingerprint) {
+      cache[fingerprint] = {
+        mode: mode, ts: Date.now(),
+        loudness_lufs: mergedData.loudness_lufs,
+        true_peak_dbtp: mergedData.true_peak_dbtp,
+        loudness_range_lu: mergedData.loudness_range_lu,
+        threshold_lufs: mergedData.threshold_lufs,
+        offset_lu: mergedData.offset_lu
+      };
+      saveCache();
+    }
+
+    applyR128Filter(mergedData, mode, maxCompression, showOsd, osdDuration, tags);
 
   } catch (err) {
     console.log("Analysis error: " + err);
-    if (showOsd) showStatus("skip", "Normalize: error", osdDuration);
+    if (showOsd) showStatus("skip", "Error", osdDuration);
   }
 }
 
@@ -764,7 +968,6 @@ event.on("iina.file-loaded", async function() {
     toggleItem.selected = isEnabled;
     menu.forceUpdate();
   }
-
   if (!isEnabled) return;
   await runAnalysis(false);
 });
