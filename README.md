@@ -1,4 +1,4 @@
-# iina-audio-normalize
+# IINA Audio Normalize
 
 Automatic audio normalization for IINA. Analyzes each file on playback and applies gain to bring the volume to a consistent level.
 
