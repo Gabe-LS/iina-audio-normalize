@@ -353,7 +353,9 @@ async function scanPeak(filePath, ffmpegPath, onProgress) {
      "-af", "volumedetect", "-progress", "pipe:1", "-f", "null", "/dev/null"];
   var result = await utils.exec(ffmpegPath, args, undefined, onProgress);
   if (result.status !== 0) {
-    console.log("ffmpeg exited with status " + result.status + ", attempting to parse output anyway");
+    console.log("ffmpeg volumedetect exited with status " + result.status);
+    var tail = result.stderr ? result.stderr.slice(-500) : "(empty)";
+    console.log("ffmpeg stderr: " + tail);
   }
   var match = result.stderr.match(/max_volume:\s*([+\-\d.]+)/);
   if (!match) return null;
@@ -428,6 +430,9 @@ async function scanEbur128(filePath, ffmpegPath, onProgress) {
   var result = await utils.exec(ffmpegPath, args, undefined, onProgress);
   if (result.status !== 0) {
     console.log("ffmpeg ebur128 exited with status " + result.status);
+    // Log last 500 chars of stderr to diagnose failures (e.g. file not found, codec issues)
+    var tail = result.stderr ? result.stderr.slice(-500) : "(empty)";
+    console.log("ffmpeg stderr: " + tail);
   }
   return parseEbur128Summary(result.stderr);
 }
@@ -458,6 +463,8 @@ async function scanLoudnormOffset(filePath, ffmpegPath, preset, onProgress) {
   var result = await utils.exec(ffmpegPath, args, undefined, onProgress);
   if (result.status !== 0) {
     console.log("ffmpeg loudnorm exited with status " + result.status);
+    var tail = result.stderr ? result.stderr.slice(-500) : "(empty)";
+    console.log("ffmpeg stderr: " + tail);
   }
 
   var parsed = parseR128Json(result.stderr);
