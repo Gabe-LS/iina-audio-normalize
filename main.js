@@ -620,9 +620,17 @@ function applyR128Filter(entry, preset, maxCompression, showOsd, osdDuration, ta
 function createProgressHook(totalDurationSec, label, showOsd) {
   var lastLoggedPct = -10;
   var lastDisplayedPct = -1;
+  var lastUpdateTime = 0; // time-based throttle: process at most once per second
 
   return function(data) {
     if (!totalDurationSec || totalDurationSec <= 0) return;
+
+    // Throttle: skip processing if less than 1 second since last update.
+    // Prevents excessive JS bridge calls from ffmpeg's ~2 Hz progress output.
+    var now = Date.now();
+    if (now - lastUpdateTime < 1000) return;
+    lastUpdateTime = now;
+
     var match = data.match(/out_time_us=(\d+)/);
     if (!match) return;
     var currentUs = parseInt(match[1]);
@@ -683,12 +691,63 @@ function findFfmpeg() {
 
 loadCache();
 
-var isEnabled = preferences.get("enabled") !== false;
+var STATE_PATH = "@data/state.json"; // persisted plugin state (enabled toggle, etc.)
+
+/**
+ * Read persisted plugin state from disk.
+ * Returns an object with state values, or empty defaults.
+ */
+function loadState() {
+  try {
+    if (file.exists(STATE_PATH)) {
+      var content = file.read(STATE_PATH);
+      var parsed = JSON.parse(content);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return parsed;
+    }
+  } catch (e) {
+    console.log("State load failed: " + e);
+  }
+  return {};
+}
+
+/** Write plugin state to disk. */
+function saveState(state) {
+  try {
+    file.write(STATE_PATH, JSON.stringify(state));
+  } catch (e) {
+    console.log("State save failed: " + e);
+  }
+}
+
+/**
+ * Read the enabled flag. Priority:
+ *   1. Persisted state file (set by menu toggle, survives restarts)
+ *   2. Preferences page checkbox (initial default)
+ *   3. true (factory default)
+ */
+function isEnabledPref() {
+  var state = loadState();
+  if (typeof state.enabled === "boolean") return state.enabled;
+  // Fall back to preferences page value
+  var val = preferences.get("enabled");
+  if (val === false || val === "false" || val === 0 || val === "0") return false;
+  return true;
+}
+
+/** Persist the enabled flag to disk. */
+function setEnabledPref(enabled) {
+  var state = loadState();
+  state.enabled = enabled;
+  saveState(state);
+}
+
+var isEnabled = isEnabledPref();
+console.log("Enabled state: " + isEnabled);
 
 // Menu: toggle enable/disable with checkmark
 var toggleItem = menu.item("Audio Normalize", function() {
   isEnabled = !isEnabled;
-  preferences.set("enabled", isEnabled);
+  setEnabledPref(isEnabled);
   toggleItem.selected = isEnabled;
   menu.forceUpdate();
 
@@ -968,8 +1027,8 @@ async function runAnalysis(forceRescan) {
 
 // Trigger analysis on every file load (if enabled)
 event.on("iina.file-loaded", async function() {
-  // Sync menu checkmark with preference (in case changed via preferences page)
-  var prefEnabled = preferences.get("enabled") !== false;
+  // Re-read persisted state (handles multi-window or preferences page changes)
+  var prefEnabled = isEnabledPref();
   if (prefEnabled !== isEnabled) {
     isEnabled = prefEnabled;
     toggleItem.selected = isEnabled;
